@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Acceso | Cabañas Las Tinajas</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f5f6f8;font-family:Arial,sans-serif;color:#111}.login{width:min(400px,calc(100% - 32px));background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:32px;box-shadow:0 12px 40px rgba(0,0,0,.08)}.brand{text-align:center;margin-bottom:28px}.logo{font-size:42px}.brand h1{margin:10px 0 4px;font-size:25px}.brand p{margin:0;color:#777;font-size:14px}.field{margin-bottom:16px}.field label{display:block;margin-bottom:7px;font-weight:700;font-size:14px}.field input{width:100%;padding:13px;border:1px solid #d5d7dc;border-radius:9px;font-size:16px;outline:none}.field input:focus{border-color:#888}.btn{width:100%;padding:13px;border:0;border-radius:9px;background:#111;color:#fff;font-weight:700;font-size:16px;cursor:pointer}.btn:disabled{opacity:.6}.mensaje{min-height:22px;margin-top:14px;text-align:center;color:#c62828;font-size:14px}</style>
+</head>
+<body>
+  <main class="login">
+    <div class="brand"><div class="logo">🏡</div><h1>Cabañas Las Tinajas</h1><p>Acceso al sistema de gestión</p></div>
+    <form id="loginForm">
+      <div class="field"><label for="usuario">Usuario</label><input id="usuario" autocomplete="username" required autofocus></div>
+      <div class="field"><label for="password">Contraseña</label><input id="password" type="password" autocomplete="current-password" required></div>
+      <button class="btn" id="btn" type="submit">Ingresar</button>
+      <div class="mensaje" id="mensaje"></div>
+    </form>
+  </main>
+  <script>
+    const form=document.getElementById("loginForm"),btn=document.getElementById("btn"),msg=document.getElementById("mensaje");
+    const params=new URLSearchParams(location.search);
+    const redirect=params.get("redirect") || "/";
+    form.addEventListener("submit",async(e)=>{
+      e.preventDefault(); msg.textContent=""; btn.disabled=true; btn.textContent="Ingresando...";
+      try{
+        const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usuario:document.getElementById("usuario").value.trim(),password:document.getElementById("password").value})});
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.error || "No se pudo iniciar sesión.");
+        location.href=redirect.startsWith("/") ? redirect : "/";
+      }catch(err){msg.textContent=err.message;btn.disabled=false;btn.textContent="Ingresar";}
+    });
+  </script>
+</body>
+</html>
