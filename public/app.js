@@ -1,10 +1,29 @@
 const $ = (s) => document.querySelector(s);
 const content = $("#content");
 let cabins = [],
-  settings = {};
+  settings = {},
+  clients = [];
 let currentView = "dashboard";
 let calendarOffset = 0;
 const colors = ["green", "blue", "yellow", "pink"];
+function getNights(checkIn, checkOut) {
+  if (!checkIn || !checkOut) return 1;
+
+  const startDate = checkIn.slice(0, 10);
+  const endDate = checkOut.slice(0, 10);
+
+  const [startYear, startMonth, startDay] = startDate.split("-").map(Number);
+  const [endYear, endMonth, endDay] = endDate.split("-").map(Number);
+
+  const start = Date.UTC(startYear, startMonth - 1, startDay);
+  const end = Date.UTC(endYear, endMonth - 1, endDay);
+
+  return Math.max(
+    1,
+    Math.round((end - start) / (1000 * 60 * 60 * 24)),
+  );
+}
+
 async function api(url, opts) {
   const r = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -22,6 +41,7 @@ async function api(url, opts) {
 async function init() {
   cabins = await api("/api/cabins");
   settings = await api("/api/settings");
+  clients = await api("/api/clients");
   document
     .querySelectorAll("[data-view]")
     .forEach((b) => (b.onclick = () => go(b.dataset.view)));
@@ -253,24 +273,35 @@ async function renderCabins() {
   content.innerHTML = `<div class="content"><div class="grid cabins">${cabins.map((c) => `<div class="card cabin-card"><div class="cabin-number">Cabaña ${c.id}</div><div class="capacity">Hasta ${c.capacity} personas</div><div class="beds">${c.rooms.map((x) => `<div class="bed-row"><b>${esc(x.name)}</b><br>${esc(x.beds)}</div>`).join("")}</div><small>✓ Cochera privada · ✓ WiFi · ✓ Ropa blanca · ✓ Pileta termal · ✓ Asador</small></div>`).join("")}</div><div class="note" style="margin-top:18px"><b>Cabaña 5:</b> recepción. No está disponible para reservas. Capacidad total del complejo: 52 personas.</div></div>`;
 }
 async function renderClients() {
-  const rs = await api("/api/reservations");
-  const map = {};
-  rs.forEach((r) => {
-    const k = (r.phone || r.clientName).toLowerCase();
-    if (!map[k])
-      map[k] = {
-        name: r.clientName,
-        phone: r.phone || "",
-        count: 0,
-        last: r.checkIn,
-      };
-    map[k].count++;
-    if (r.checkIn > map[k].last) map[k].last = r.checkIn;
+  clients = await api("/api/clients");
+  const reservations = await api("/api/reservations");
+  const enriched = clients.map((c) => {
+    const rs = reservations.filter((r) => r.clientId === c.id || String(r.clientName).toLowerCase() === String(c.name).toLowerCase());
+    return { ...c, count: rs.length, last: rs.reduce((max, r) => r.checkIn > max ? r.checkIn : max, "") };
   });
-  const clients = Object.values(map).sort((a, b) =>
-    b.last.localeCompare(a.last),
-  );
-  content.innerHTML = `<div class="content"><div class="card"><table class="table"><thead><tr><th>Cliente</th><th>Teléfono</th><th>Reservas</th><th>Última estadía</th></tr></thead><tbody>${clients.map((c) => `<tr><td><b>${esc(c.name)}</b></td><td>${esc(c.phone)}</td><td>${c.count}</td><td>${fmt(c.last)}</td></tr>`).join("")}</tbody></table>${clients.length ? "" : '<div class="empty">Los clientes aparecerán al cargar reservas.</div>'}</div></div>`;
+  content.innerHTML = `<div class="content"><div class="toolbar"><span>Guardá los datos de cada cliente una sola vez para reutilizarlos en futuras reservas.</span><button class="primary" onclick="newClient()">＋ Nuevo cliente</button></div><div class="card"><table class="table"><thead><tr><th>Cliente</th><th>Teléfono</th><th>Dirección</th><th>Mail</th><th>Reservas</th><th>Última estadía</th></tr></thead><tbody>${enriched.map((c) => `<tr><td><b>${esc(c.name)}</b></td><td>${esc(c.phone || "")}</td><td>${esc(c.address || "")}</td><td>${esc(c.email || "")}</td><td>${c.count}</td><td>${c.last ? fmt(c.last) : "-"}</td></tr>`).join("")}</tbody></table>${enriched.length ? "" : '<div class="empty">No hay clientes registrados.</div>'}</div></div>`;
+}
+async function newClient() {
+  modal(`<div class="modal-head"><div><h2>Nuevo cliente</h2><small>Estos datos quedarán guardados para futuras reservas.</small></div><button class="icon-btn" onclick="closeModal()">×</button></div><form class="form" onsubmit="saveClient(event)"><div class="field full"><label>Nombre</label><input name="name" required></div><div class="field"><label>Teléfono</label><input name="phone"></div><div class="field"><label>Mail</label><input type="email" name="email"></div><div class="field full"><label>Dirección</label><input name="address"></div><div class="form-actions"><button type="button" class="secondary" onclick="closeModal()">Cancelar</button><button class="primary">Guardar cliente</button></div></form>`);
+}
+async function saveClient(e) {
+  e.preventDefault();
+
+  const body = Object.fromEntries(new FormData(e.target).entries());
+
+  try {
+    await api("/api/clients", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+
+    clients = await api("/api/clients");
+
+    closeModal();
+    renderClients();
+  } catch (err) {
+    alert(err.message);
+  }
 }
 async function renderPayments() {
   const [reservations, payments, settings] = await Promise.all([
@@ -283,23 +314,14 @@ async function renderPayments() {
     (r) => r.status !== "cancelada",
   );
 
-  const getNights = (checkIn, checkOut) => {
-    const start = new Date(checkIn);
-    const end = new Date(checkOut);
-
-    const diff = end.getTime() - start.getTime();
-
-    return Math.max(1, Math.ceil(diff / (1000 * 60 * 60 * 24)));
-  };
-
   const getTotal = (reservation) => {
     const nights = getNights(reservation.checkIn, reservation.checkOut);
 
+    if (reservation.total != null) return Number(reservation.total || 0);
     return (
-      Number(reservation.guests || 0) *
-      Number(settings.pricePerPerson || 0) *
-      nights
-    );
+      Number(reservation.adults ?? reservation.guests ?? 0) * Number(reservation.adultPricePerPerson ?? settings.pricePerPerson ?? 0) +
+      Number(reservation.children || 0) * Number(reservation.childPricePerPerson ?? settings.childPricePerPerson ?? 0)
+    ) * nights;
   };
 
   const getPaid = (reservationId) => {
@@ -477,18 +499,28 @@ async function addPayment(reservationId) {
 
   const settings = await api("/api/settings");
 
-  const start = new Date(reservation.checkIn);
-  const end = new Date(reservation.checkOut);
-
-  const nights = Math.max(
-    1,
-    Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)),
-  );
+  const nights = getNights(
+  reservation.checkIn,
+  reservation.checkOut,
+);
 
   const total =
-    Number(reservation.guests || 0) *
-    Number(settings.pricePerPerson || 0) *
-    nights;
+    reservation.total != null
+      ? Number(reservation.total || 0)
+      : (
+          Number(reservation.adults ?? reservation.guests ?? 0) *
+            Number(
+              reservation.adultPricePerPerson ??
+                settings.pricePerPerson ??
+                0,
+            ) +
+          Number(reservation.children || 0) *
+            Number(
+              reservation.childPricePerPerson ??
+                settings.childPricePerPerson ??
+                0,
+            )
+        ) * nights;
 
   const balance = Math.max(0, total - paid);
 
@@ -632,7 +664,7 @@ async function renderBlocks() {
     )}</tbody></table>${bs.length ? "" : '<div class="empty">No hay bloqueos.</div>'}</div></div>`;
 }
 async function renderSettings() {
-  content.innerHTML = `<div class="content"><div class="card"><div class="section-title">Datos del establecimiento</div><form class="form" onsubmit="saveSettings(event)"><div class="field"><label>Nombre</label><input name="business" value="${esc(settings.business)}"></div><div class="field"><label>Responsable / dueño</label><input name="owner" value="${esc(settings.owner)}"></div><div class="field"><label>Teléfono de reservas</label><input name="phone" value="${esc(settings.phone)}"></div><div class="field"><label>Precio por persona</label><input type="number" name="pricePerPerson" value="${settings.pricePerPerson}"></div><div class="field"><label>Horario de entrada</label><input type="time" name="checkIn" value="${settings.checkIn}"></div><div class="field"><label>Horario de salida</label><input type="time" name="checkOut" value="${settings.checkOut}"></div><div class="form-actions"><button class="primary">Guardar cambios</button></div></form></div></div>`;
+  content.innerHTML = `<div class="content"><div class="card"><div class="section-title">Datos del establecimiento</div><form class="form" onsubmit="saveSettings(event)"><div class="field"><label>Nombre</label><input name="business" value="${esc(settings.business)}"></div><div class="field"><label>Responsable / dueño</label><input name="owner" value="${esc(settings.owner)}"></div><div class="field"><label>Teléfono de reservas</label><input name="phone" value="${esc(settings.phone)}"></div><div class="field"><label>Precio adulto</label><input type="number" name="pricePerPerson" value="${settings.pricePerPerson}"></div><div class="field"><label>Precio niño</label><input type="number" name="childPricePerPerson" value="${settings.childPricePerPerson || 0}"></div><div class="field"><label>Horario de entrada</label><input type="time" name="checkIn" value="${settings.checkIn}"></div><div class="field"><label>Horario de salida</label><input type="time" name="checkOut" value="${settings.checkOut}"></div><div class="form-actions"><button class="primary">Guardar cambios</button></div></form></div></div>`;
 }
 function modal(html) {
   $("#modal").innerHTML = `<div class="modal-box">${html}</div>`;
@@ -643,303 +675,84 @@ function closeModal() {
 }
 async function newReservation(existing = null) {
   const r = existing;
-
   const reservations = await api("/api/reservations");
   const blocks = await api("/api/blocks");
+  clients = await api("/api/clients");
+  const initialClient = r ? clients.find((c) => c.id === r.clientId) : null;
+  const initialItems = r ? [{ cabinId: r.cabinId, adults: r.adults ?? r.guests ?? 1, children: r.children ?? 0, adultPricePerPerson: r.adultPricePerPerson ?? settings.pricePerPerson, childPricePerPerson: r.childPricePerPerson ?? settings.childPricePerPerson ?? 0, deposit: r.deposit ?? 0, notes: r.notes ?? "" }] : [{ cabinId: cabins[0]?.id, adults: 2, children: 0, adultPricePerPerson: settings.pricePerPerson, childPricePerPerson: settings.childPricePerPerson || 0, deposit: 0, notes: "" }];
 
-  modal(`
-    <div class="modal-head">
-      <div>
-        <h2>${r ? "Editar reserva" : "Nueva reserva"}</h2>
-        <small>
-          Los horarios permiten salida e ingreso el mismo día.
-        </small>
-      </div>
+  const cabinOptions = (selected) => cabins.map((c) => `<option value="${c.id}" ${Number(selected) === c.id ? "selected" : ""}>Cabaña ${c.id} · hasta ${c.capacity} personas</option>`).join("");
+  const itemHtml = (item, index) => `<div class="card reservation-cabin-item" data-index="${index}" style="margin-top:12px;padding:16px"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><b>Cabaña <span class="cabin-label">${item.cabinId || ""}</span></b>${index ? `<button type="button" class="small-btn danger remove-cabin" data-index="${index}">Quitar</button>` : ""}</div><div class="form" style="margin-top:12px"><div class="field"><label>Cabaña</label><select name="cabinId">${cabinOptions(item.cabinId)}</select></div><div class="field"><label>Adultos</label><input type="number" min="0" name="adults" value="${item.adults}"></div><div class="field"><label>Niños</label><input type="number" min="0" name="children" value="${item.children}"></div><div class="field"><label>Precio adulto</label><input type="number" min="0" name="adultPricePerPerson" value="${item.adultPricePerPerson}"></div><div class="field"><label>Precio niño</label><input type="number" min="0" name="childPricePerPerson" value="${item.childPricePerPerson}"></div><div class="field"><label>Seña</label><input type="number" min="0" name="deposit" value="${item.deposit || 0}"></div><div class="field full"><label>Notas</label><textarea name="notes">${esc(item.notes || "")}</textarea></div></div><div class="cabin-total" style="margin-top:10px;font-weight:700"></div><div class="availability-info cabin-availability"></div></div>`;
 
-      <button class="icon-btn" onclick="closeModal()">×</button>
-    </div>
+  modal(`<div class="modal-head"><div><h2>${r ? "Editar reserva" : "Nueva reserva"}</h2><small>Una misma reserva puede incluir varias cabañas.</small></div><button class="icon-btn" onclick="closeModal()">×</button></div><form id="reservationForm" class="form" onsubmit="saveReservation(event,'${r?.id || ""}')"><div class="field full"><label>Cliente</label><input id="clientSearch" list="clientList" name="clientName" required value="${esc(r?.clientName || initialClient?.name || "")}" placeholder="Buscar cliente o escribir uno nuevo"><datalist id="clientList">${clients.map((c) => `<option value="${esc(c.name)}" data-id="${c.id}">${esc(c.phone || "")}</option>`).join("")}</datalist></div><div class="field"><label>Teléfono</label><input id="clientPhone" name="phone" value="${esc(r?.phone || initialClient?.phone || "")}"></div><div class="field"><label>Mail</label><input id="clientEmail" name="email" type="email" value="${esc(r?.email || initialClient?.email || "")}"></div><div class="field full"><label>Dirección</label><input id="clientAddress" name="address" value="${esc(r?.address || initialClient?.address || "")}"></div><div class="field"><label>Entrada</label><input id="reservationCheckIn" type="datetime-local" name="checkIn" required value="${localInput(r?.checkIn)}"></div><div class="field"><label>Salida</label><input id="reservationCheckOut" type="datetime-local" name="checkOut" required value="${localInput(r?.checkOut)}"></div><div class="field"><label>Estado</label><select name="status"><option ${r?.status === "confirmada" || !r ? "selected" : ""}>confirmada</option><option ${r?.status === "pendiente" ? "selected" : ""}>pendiente</option><option ${r?.status === "cancelada" ? "selected" : ""}>cancelada</option></select></div><div class="field full"><label>Cabañas de esta reserva</label><div id="reservationCabins">${initialItems.map(itemHtml).join("")}</div><button type="button" class="secondary" id="addCabin" style="margin-top:12px">＋ Agregar otra cabaña</button></div><div class="card full" style="margin-top:8px"><b>Total de la reserva:</b> <span id="reservationGrandTotal">$0</span></div><div class="form-actions"><button type="button" class="secondary" onclick="closeModal()">Cancelar</button><button class="primary">${r ? "Guardar cambios" : "Crear reserva"}</button></div></form>`);
 
-    <form
-      id="reservationForm"
-      class="form"
-      onsubmit="saveReservation(event,'${r?.id || ""}')"
-    >
-
-      <div class="field full">
-        <label>Cliente</label>
-        <input
-          name="clientName"
-          required
-          value="${esc(r?.clientName || "")}"
-        >
-      </div>
-
-      <div class="field">
-        <label>Teléfono</label>
-        <input
-          name="phone"
-          value="${esc(r?.phone || "")}"
-        >
-      </div>
-
-      <div class="field">
-        <label>Huéspedes</label>
-        <input
-          id="reservationGuests"
-          type="number"
-          min="1"
-          max="8"
-          name="guests"
-          required
-          value="${r?.guests || 2}"
-        >
-      </div>
-
-      <div class="field full">
-        <label>Cabaña</label>
-
-        <select id="reservationCabin" name="cabinId" required>
-          ${cabins
-            .map(
-              (c) => `
-                <option value="${c.id}">
-                  Cabaña ${c.id} · hasta ${c.capacity} personas
-                </option>
-              `,
-            )
-            .join("")}
-        </select>
-
-        <div
-          id="cabinAvailabilityInfo"
-          class="availability-info"
-        ></div>
-      </div>
-
-      <div class="field">
-        <label>Estado</label>
-
-        <select name="status">
-          <option ${r?.status === "confirmada" ? "selected" : ""}>
-            confirmada
-          </option>
-
-          <option ${r?.status === "pendiente" ? "selected" : ""}>
-            pendiente
-          </option>
-
-          <option ${r?.status === "cancelada" ? "selected" : ""}>
-            cancelada
-          </option>
-        </select>
-      </div>
-
-      <div class="field">
-        <label>Entrada</label>
-
-        <input
-          id="reservationCheckIn"
-          type="datetime-local"
-          name="checkIn"
-          required
-          value="${localInput(r?.checkIn)}"
-        >
-      </div>
-
-      <div class="field">
-        <label>Salida</label>
-
-        <input
-          id="reservationCheckOut"
-          type="datetime-local"
-          name="checkOut"
-          required
-          value="${localInput(r?.checkOut)}"
-        >
-      </div>
-
-      <div class="field">
-        <label>Seña</label>
-
-        <input
-          type="number"
-          min="0"
-          name="deposit"
-          value="${r?.deposit || 0}"
-        >
-      </div>
-
-      <div class="field full">
-        <label>Notas</label>
-
-        <textarea name="notes">${esc(r?.notes || "")}</textarea>
-      </div>
-
-      <div class="form-actions">
-        <button
-          type="button"
-          class="secondary"
-          onclick="closeModal()"
-        >
-          Cancelar
-        </button>
-
-        <button class="primary">
-          ${r ? "Guardar cambios" : "Crear reserva"}
-        </button>
-      </div>
-
-    </form>
-  `);
-
-  const guestsInput = document.querySelector("#reservationGuests");
-  const cabinSelect = document.querySelector("#reservationCabin");
-  const checkInInput = document.querySelector("#reservationCheckIn");
-  const checkOutInput = document.querySelector("#reservationCheckOut");
-  const availabilityInfo = document.querySelector("#cabinAvailabilityInfo");
-
-  function isAvailable(cabinId, checkIn, checkOut) {
-    if (!checkIn || !checkOut) {
-      return true;
-    }
-
-    const start = new Date(checkIn).getTime();
-    const end = new Date(checkOut).getTime();
-
-    if (!start || !end || end <= start) {
-      return false;
-    }
-
-    const reservationConflict = reservations.some((reservation) => {
-      if (reservation.id === r?.id) {
-        return false;
-      }
-
-      if (
-        reservation.cabinId !== Number(cabinId) ||
-        reservation.status === "cancelada"
-      ) {
-        return false;
-      }
-
-      const reservationStart = new Date(reservation.checkIn).getTime();
-
-      const reservationEnd = new Date(reservation.checkOut).getTime();
-
-      return start < reservationEnd && reservationStart < end;
-    });
-
-    if (reservationConflict) {
-      return false;
-    }
-
-    const blockConflict = blocks.some((block) => {
-      if (block.cabinId !== Number(cabinId)) {
-        return false;
-      }
-
-      const blockStart = new Date(block.start).getTime();
-      const blockEnd = new Date(block.end).getTime();
-
-      return start < blockEnd && blockStart < end;
-    });
-
-    return !blockConflict;
+  const cabinsBox = document.querySelector("#reservationCabins");
+  const clientSearch = document.querySelector("#clientSearch");
+  function fillClient() {
+    const c = clients.find((x) => x.name.toLowerCase() === clientSearch.value.trim().toLowerCase());
+    if (!c) return;
+    $("#clientPhone").value = c.phone || ""; $("#clientEmail").value = c.email || ""; $("#clientAddress").value = c.address || "";
   }
+  clientSearch.addEventListener("change", fillClient);
+  clientSearch.addEventListener("blur", fillClient);
 
-  function updateCabinOptions() {
-    const guests = Number(guestsInput.value || 0);
-    const checkIn = checkInInput.value;
-    const checkOut = checkOutInput.value;
-
-    let availableCount = 0;
-
-    cabins.forEach((cabin) => {
-      const option = cabinSelect.querySelector(`option[value="${cabin.id}"]`);
-
-      const enoughCapacity = guests > 0 && guests <= cabin.capacity;
-
-      const available =
-        enoughCapacity && isAvailable(cabin.id, checkIn, checkOut);
-
-      option.disabled = !available;
-
-      if (available) {
-        option.textContent = `🟢 Cabaña ${cabin.id} · hasta ${cabin.capacity} personas · Disponible`;
-
-        availableCount++;
-      } else if (!enoughCapacity) {
-        option.textContent = `🔴 Cabaña ${cabin.id} · hasta ${cabin.capacity} personas · Capacidad insuficiente`;
-      } else if (checkIn && checkOut) {
-        option.textContent = `🔴 Cabaña ${cabin.id} · hasta ${cabin.capacity} personas · No disponible`;
-      } else {
-        option.textContent = `🟡 Cabaña ${cabin.id} · hasta ${cabin.capacity} personas`;
-      }
-    });
-
-    const currentOption = cabinSelect.querySelector(
-      `option[value="${cabinSelect.value}"]`,
-    );
-
-    if (currentOption?.disabled) {
-      const firstAvailable = Array.from(cabinSelect.options).find(
-        (option) => !option.disabled,
-      );
-
-      if (firstAvailable) {
-        cabinSelect.value = firstAvailable.value;
-      }
-    }
-
-    if (guests > 0 && checkIn && checkOut) {
-      availabilityInfo.innerHTML =
-        availableCount > 0
-          ? `🟢 <b>${availableCount}</b> cabaña${
-              availableCount !== 1 ? "s" : ""
-            } disponible${
-              availableCount !== 1 ? "s" : ""
-            } para ${guests} huésped${guests !== 1 ? "es" : ""}.`
-          : "🔴 No hay cabañas disponibles para esos huéspedes y horarios.";
-    } else if (guests > 0) {
-      const capacityCount = cabins.filter(
-        (cabin) => guests <= cabin.capacity,
-      ).length;
-
-      availabilityInfo.innerHTML = `ℹ️ Hay <b>${capacityCount}</b> cabaña${
-        capacityCount !== 1 ? "s" : ""
-      } con capacidad para ${guests} huésped${
-        guests !== 1 ? "es" : ""
-      }. Elegí las fechas para comprobar disponibilidad.`;
-    } else {
-      availabilityInfo.innerHTML = "";
-    }
+  function readItems() {
+    return [...cabinsBox.querySelectorAll(".reservation-cabin-item")].map((box) => ({ cabinId: Number(box.querySelector('[name="cabinId"]').value), adults: Number(box.querySelector('[name="adults"]').value || 0), children: Number(box.querySelector('[name="children"]').value || 0), adultPricePerPerson: Number(box.querySelector('[name="adultPricePerPerson"]').value || 0), childPricePerPerson: Number(box.querySelector('[name="childPricePerPerson"]').value || 0), deposit: Number(box.querySelector('[name="deposit"]').value || 0), notes: box.querySelector('[name="notes"]').value || "" }));
   }
-
-  guestsInput.addEventListener("input", updateCabinOptions);
-
-  checkInInput.addEventListener("change", updateCabinOptions);
-
-  checkOutInput.addEventListener("change", updateCabinOptions);
-
-  updateCabinOptions();
+  function available(cabinId, checkIn, checkOut, ignoreId) {
+    if (!checkIn || !checkOut) return true;
+    const start = new Date(checkIn).getTime(), end = new Date(checkOut).getTime();
+    if (!start || !end || end <= start) return false;
+    return !reservations.some((x) => x.id !== ignoreId && Number(x.cabinId) === Number(cabinId) && x.status !== "cancelada" && start < new Date(x.checkOut).getTime() && new Date(x.checkIn).getTime() < end) && !blocks.some((x) => Number(x.cabinId) === Number(cabinId) && start < new Date(x.end).getTime() && new Date(x.start).getTime() < end);
+  }
+  function updateTotals() {
+    const items = readItems();
+    const checkIn = $("#reservationCheckIn").value, checkOut = $("#reservationCheckOut").value;
+    const nights =
+  checkIn && checkOut
+    ? getNights(checkIn, checkOut)
+    : 1;
+    let grand = 0;
+    cabinsBox.querySelectorAll(".reservation-cabin-item").forEach((box, i) => {
+      const item = items[i], cabin = cabins.find((c) => c.id === item.cabinId);
+      const guests = item.adults + item.children;
+      const total = (item.adults * item.adultPricePerPerson + item.children * item.childPricePerPerson) * nights;
+      grand += total;
+      box.querySelector(".cabin-label").textContent = item.cabinId || "";
+      box.querySelector(".cabin-total").textContent = `Total cabaña: $${money(total)} · ${guests} huésped${guests === 1 ? "" : "es"}`;
+      const ok = cabin && guests > 0 && guests <= cabin.capacity && available(item.cabinId, checkIn, checkOut, r?.id);
+      box.querySelector(".cabin-availability").innerHTML = ok ? "🟢 Disponible" : (guests > (cabin?.capacity || 0) ? `🔴 Capacidad máxima: ${cabin?.capacity || 0}` : "🔴 No disponible en ese horario");
+    });
+    $("#reservationGrandTotal").textContent = `$${money(grand)}`;
+  }
+  function bind() {
+    cabinsBox.querySelectorAll("select,input,textarea").forEach((el) => el.addEventListener("input", updateTotals));
+    cabinsBox.querySelectorAll(".remove-cabin").forEach((btn) => btn.addEventListener("click", () => { btn.closest(".reservation-cabin-item").remove(); updateTotals(); }));
+    updateTotals();
+  }
+  document.querySelector("#addCabin").addEventListener("click", () => {
+    const item = { cabinId: cabins.find((c) => available(c.id, $("#reservationCheckIn").value, $("#reservationCheckOut").value, r?.id))?.id || cabins[0]?.id, adults: 1, children: 0, adultPricePerPerson: settings.pricePerPerson, childPricePerPerson: settings.childPricePerPerson || 0, deposit: 0, notes: "" };
+    cabinsBox.insertAdjacentHTML("beforeend", itemHtml(item, cabinsBox.children.length));
+    bind();
+  });
+  $("#reservationCheckIn").addEventListener("input", updateTotals); $("#reservationCheckOut").addEventListener("input", updateTotals);
+  bind();
 }
 async function saveReservation(e, id) {
   e.preventDefault();
   const f = new FormData(e.target);
-  const body = Object.fromEntries(f.entries());
-  body.guests = Number(body.guests);
-  body.cabinId = Number(body.cabinId);
-  body.deposit = Number(body.deposit || 0);
+  const data = Object.fromEntries(f.entries());
+  const boxes = [...document.querySelectorAll("#reservationCabins .reservation-cabin-item")];
+  const items = boxes.map((box) => ({ cabinId: Number(box.querySelector('[name="cabinId"]').value), adults: Number(box.querySelector('[name="adults"]').value || 0), children: Number(box.querySelector('[name="children"]').value || 0), adultPricePerPerson: Number(box.querySelector('[name="adultPricePerPerson"]').value || 0), childPricePerPerson: Number(box.querySelector('[name="childPricePerPerson"]').value || 0), deposit: Number(box.querySelector('[name="deposit"]').value || 0), notes: box.querySelector('[name="notes"]').value || "" }));
   try {
-    await api(id ? `/api/reservations/${id}` : "/api/reservations", {
-      method: id ? "PUT" : "POST",
-      body: JSON.stringify(body),
-    });
-    closeModal();
-    go(currentView);
-  } catch (err) {
-    alert(err.message);
-  }
+    if (id) {
+      if (items.length !== 1) throw new Error("Para editar una reserva existente, modificá una cabaña por vez.");
+      await api(`/api/reservations/${id}`, { method: "PUT", body: JSON.stringify({ clientName: data.clientName, phone: data.phone, email: data.email, address: data.address, checkIn: data.checkIn, checkOut: data.checkOut, status: data.status, ...items[0] }) });
+    } else {
+      await api("/api/reservation-groups", { method: "POST", body: JSON.stringify({ client: { name: data.clientName, phone: data.phone, email: data.email, address: data.address }, checkIn: data.checkIn, checkOut: data.checkOut, status: data.status, cabins: items }) });
+    }
+    closeModal(); go(currentView);
+  } catch (err) { alert(err.message); }
 }
 async function editReservation(id) {
   const rs = await api("/api/reservations");
@@ -978,6 +791,7 @@ async function saveSettings(e) {
   e.preventDefault();
   const b = Object.fromEntries(new FormData(e.target).entries());
   b.pricePerPerson = Number(b.pricePerPerson);
+  b.childPricePerPerson = Number(b.childPricePerPerson || 0);
   settings = await api("/api/settings", {
     method: "PUT",
     body: JSON.stringify(b),
@@ -1029,6 +843,10 @@ function localInput(s) {
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
+async function logout() {
+  try { await fetch("/api/logout", { method: "POST" }); } finally { window.location.href = "/login.html"; }
+}
+
 init();
 
 async function editBlock(id) {
