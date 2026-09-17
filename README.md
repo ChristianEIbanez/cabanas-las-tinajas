@@ -33,3 +33,13 @@ Recepción: cabaña 5
 Capacidad total: 52 personas
 
 El archivo `data/db.json` se crea automáticamente al iniciar.
+
+## Tecnologías
+
+- HTML
+- CSS
+- JavaScript
+- Node.js
+- Express.js
+- Git
+- GitHub
