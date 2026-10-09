@@ -4,11 +4,32 @@ const fs = require("fs");
 const { Pool } = require("pg");
 const path = require("path");
 const crypto = require("crypto");
+const PDFDocument = require("pdfkit");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "db.json");
+const CHECK_IN_TIME = "11:00";
+const CHECK_OUT_TIME = "10:00";
+function fixedReservationDate(value, time) {
+  const datePart = String(value || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
+  const parsed = new Date(`${datePart}T${time}:00-03:00`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== datePart) return null;
+  return parsed.toISOString();
+}
+function normalizeStoredReservationTimes(db) {
+  if (!db.settings) db.settings = {};
+  db.settings.checkIn = CHECK_IN_TIME;
+  db.settings.checkOut = CHECK_OUT_TIME;
+  for (const reservation of db.reservations || []) {
+    const checkIn = fixedReservationDate(reservation.checkIn, CHECK_IN_TIME);
+    const checkOut = fixedReservationDate(reservation.checkOut, CHECK_OUT_TIME);
+    if (checkIn) reservation.checkIn = checkIn;
+    if (checkOut) reservation.checkOut = checkOut;
+  }
+}
 function getNights(checkIn, checkOut) {
   if (!checkIn || !checkOut) return 1;
 
@@ -112,8 +133,8 @@ function initialDb() {
       phone: "3858 442610",
       pricePerPerson: 35000,
       childPricePerPerson: 0,
-      checkIn: "14:00",
-      checkOut: "10:00",
+      checkIn: CHECK_IN_TIME,
+      checkOut: CHECK_OUT_TIME,
     },
   };
 }
@@ -142,6 +163,7 @@ async function loadDb() {
 
   if (result.rows.length > 0) {
     dbCache = result.rows[0].data;
+    normalizeStoredReservationTimes(dbCache);
     if (!Array.isArray(dbCache.clients)) dbCache.clients = [];
     if (dbCache.settings?.childPricePerPerson == null) {
       dbCache.settings.childPricePerPerson = 0;
@@ -174,6 +196,7 @@ async function loadDb() {
   }
 
   dbCache = readLocalDb();
+  normalizeStoredReservationTimes(dbCache);
   await pool.query(
     `INSERT INTO cabanas_app (id, data) VALUES (1, $1::jsonb)`,
     [JSON.stringify(dbCache)],
@@ -188,6 +211,7 @@ function readDb() {
 
 async function writeDb(db) {
   dbCache = db;
+  ensureDb();
   fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
   await pool.query(
     `
@@ -330,7 +354,7 @@ app.post("/api/clients", async (req, res) => {
 app.get("/api/settings", (req, res) => res.json(readDb().settings));
 app.put("/api/settings", async (req, res) => {
   const db = readDb();
-  db.settings = { ...db.settings, ...req.body };
+  db.settings = { ...db.settings, ...req.body, checkIn: CHECK_IN_TIME, checkOut: CHECK_OUT_TIME };
   await writeDb(db);
   res.json(db.settings);
 });
@@ -376,6 +400,149 @@ app.get("/api/dashboard", (req, res) => {
   });
 });
 
+// Descarga un ticket PDF con el detalle económico de una reserva.
+app.get("/api/reservations/:id/ticket.pdf", (req, res) => {
+  const db = readDb();
+  const reservation = db.reservations.find((r) => r.id === req.params.id);
+  if (!reservation) return res.status(404).json({ error: "Reserva no encontrada." });
+
+  const payments = (db.payments || [])
+    .filter((p) => p.reservationId === reservation.id)
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  const extras = Array.isArray(reservation.extraCharges) ? reservation.extraCharges : [];
+  const nights = getNights(reservation.checkIn, reservation.checkOut);
+  const adultCount = Number(reservation.adults ?? reservation.guests ?? 0);
+  const childCount = Number(reservation.children || 0);
+  const adultRate = Number(reservation.adultPricePerPerson ?? db.settings?.pricePerPerson ?? 0);
+  const childRate = Number(reservation.childPricePerPerson ?? db.settings?.childPricePerPerson ?? 0);
+  const lodgingTotal = reservation.total != null
+    ? Number(reservation.total || 0)
+    : (adultCount * adultRate + childCount * childRate) * nights;
+  const extrasTotal = extras.reduce((sum, x) => sum + Number(x.amount || 0), 0);
+  const paidExtras = extras.filter((x) => x.status === "paid").reduce((sum, x) => sum + Number(x.amount || 0), 0);
+  const paymentsTotal = payments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+  const lodgingPaid = Math.max(paymentsTotal, Number(reservation.deposit || 0));
+  const finalTotal = lodgingTotal + extrasTotal;
+  const totalReceived = lodgingPaid + paidExtras;
+  const balance = Math.max(0, finalTotal - totalReceived);
+  const nightsLabel = `${nights} ${nights === 1 ? "noche" : "noches"}`;
+  const formatMoney = (n) => `$ ${Number(n || 0).toLocaleString("es-AR", { maximumFractionDigits: 0 })}`;
+  const formatDate = (value) => value
+    ? new Date(value).toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "America/Argentina/Buenos_Aires" })
+    : "-";
+  const safeName = String(reservation.clientName || "cliente").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "cliente";
+  const fileName = `ticket-cabana-${reservation.cabinId}-${safeName}.pdf`;
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+  res.setHeader("Cache-Control", "no-store");
+
+  const doc = new PDFDocument({ size: "A4", margins: { top: 42, bottom: 42, left: 46, right: 46 }, info: { Title: "Ticket de estadía - Cabañas Las Tinajas", Author: "Cabañas Las Tinajas" } });
+  doc.pipe(res);
+  const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const left = doc.page.margins.left;
+  const right = doc.page.width - doc.page.margins.right;
+  const line = (y, color = "#e4e9e5") => doc.moveTo(left, y).lineTo(right, y).lineWidth(1).strokeColor(color).stroke();
+  const labelValue = (label, value, y, opts = {}) => {
+    doc.font("Helvetica").fontSize(opts.labelSize || 9).fillColor("#65736a").text(label, left, y, { width: 190 });
+    doc.font(opts.bold ? "Helvetica-Bold" : "Helvetica").fontSize(opts.valueSize || 10).fillColor(opts.color || "#24372d").text(String(value ?? "-"), left + 190, y - 1, { width: pageWidth - 190, align: "right" });
+  };
+  const sectionTitle = (title) => {
+    doc.moveDown(0.5);
+    doc.font("Helvetica-Bold").fontSize(11).fillColor("#176b4d").text(title.toUpperCase(), left, doc.y);
+    doc.moveDown(0.35);
+  };
+
+  // Encabezado visual.
+  doc.roundedRect(left, 34, pageWidth, 78, 12).fill("#176b4d");
+  doc.font("Helvetica-Bold").fontSize(19).fillColor("#ffffff").text("CABAÑAS LAS TINAJAS", left + 18, 50, { width: pageWidth - 36 });
+  doc.font("Helvetica").fontSize(9).fillColor("#e0f2e7").text("Termas de Río Hondo · Tel. 3858 442610", left + 18, 77);
+  doc.font("Helvetica-Bold").fontSize(10).fillColor("#ffffff").text("DETALLE DE ESTADÍA Y CUENTA", left + 18, 93);
+  doc.y = 130;
+
+  doc.font("Helvetica-Bold").fontSize(15).fillColor("#24372d").text(reservation.clientName || "Cliente", left, doc.y, { width: pageWidth - 120 });
+  doc.font("Helvetica").fontSize(9).fillColor("#65736a").text(`Emitido: ${formatDate(new Date())}`, right - 120, doc.y - 17, { width: 120, align: "right" });
+  doc.moveDown(0.4);
+  doc.font("Helvetica").fontSize(10).fillColor("#48564d").text(`Teléfono: ${reservation.phone || "No informado"}`);
+  if (reservation.email) doc.text(`Mail: ${reservation.email}`);
+  if (reservation.address) doc.text(`Dirección: ${reservation.address}`);
+  doc.moveDown(0.45);
+  line(doc.y);
+  doc.moveDown(0.65);
+
+  sectionTitle("Datos de la estadía");
+  labelValue("Cabaña", `N.º ${reservation.cabinId}`, doc.y, { bold: true, valueSize: 12 }); doc.moveDown(0.55);
+  labelValue("Ingreso (check-in)", `${formatDate(reservation.checkIn)} · 11:00`, doc.y); doc.moveDown(0.5);
+  labelValue("Salida (check-out)", `${formatDate(reservation.checkOut)} · 10:00`, doc.y); doc.moveDown(0.5);
+  labelValue("Duración", nightsLabel, doc.y, { bold: true }); doc.moveDown(0.5);
+  labelValue("Huéspedes", `${adultCount} adultos${childCount ? ` · ${childCount} niños` : ""}`, doc.y); doc.moveDown(0.5);
+  labelValue("Estado de reserva", reservation.status || "-", doc.y); doc.moveDown(0.2);
+  line(doc.y + 5);
+  doc.moveDown(0.65);
+
+  sectionTitle("Detalle del servicio");
+  labelValue(`Alojamiento (${adultCount} adultos${childCount ? ` + ${childCount} niños` : ""} · ${nightsLabel})`, formatMoney(lodgingTotal), doc.y, { bold: true }); doc.moveDown(0.55);
+  if (adultRate > 0) { labelValue(`Tarifa adultos: ${formatMoney(adultRate)} por persona/noche`, "", doc.y); doc.moveDown(0.45); }
+  if (childCount > 0) { labelValue(`Tarifa niños: ${formatMoney(childRate)} por persona/noche`, "", doc.y); doc.moveDown(0.45); }
+
+  sectionTitle(`Gastos extras (${extras.length})`);
+  if (!extras.length) {
+    doc.font("Helvetica-Oblique").fontSize(9).fillColor("#65736a").text("No se registraron gastos extras para esta estadía.", left, doc.y, { width: pageWidth });
+    doc.moveDown(0.65);
+  } else {
+    for (const extra of extras) {
+      const y = doc.y;
+      const statusLabel = extra.status === "paid" ? "Cobrado" : "Pendiente de cobro";
+      doc.font("Helvetica-Bold").fontSize(9).fillColor("#24372d").text(String(extra.description || "Extra"), left, y, { width: pageWidth - 125 });
+      doc.font("Helvetica-Bold").fontSize(9).fillColor("#24372d").text(formatMoney(extra.amount), right - 115, y, { width: 115, align: "right" });
+      doc.font("Helvetica").fontSize(8).fillColor(extra.status === "paid" ? "#176b4d" : "#9a6500").text(`${statusLabel}${extra.date ? ` · ${formatDate(extra.date)}` : ""}`, left, y + 13, { width: pageWidth - 20 });
+      doc.y = y + 29;
+      if (doc.y > doc.page.height - 95) { doc.addPage(); }
+    }
+  }
+  line(doc.y + 3);
+  doc.moveDown(0.7);
+
+  sectionTitle("Resumen de cuenta");
+  labelValue("Subtotal alojamiento", formatMoney(lodgingTotal), doc.y); doc.moveDown(0.5);
+  labelValue("Total gastos extras", formatMoney(extrasTotal), doc.y); doc.moveDown(0.65);
+  doc.roundedRect(left, doc.y - 4, pageWidth, 34, 8).fill("#edf7f0");
+  doc.font("Helvetica-Bold").fontSize(11).fillColor("#176b4d").text("TOTAL FINAL", left + 12, doc.y + 7);
+  doc.font("Helvetica-Bold").fontSize(13).fillColor("#176b4d").text(formatMoney(finalTotal), left + 12, doc.y + 5, { width: pageWidth - 24, align: "right" });
+  doc.y += 42;
+  labelValue("Pagos de alojamiento registrados", formatMoney(lodgingPaid), doc.y); doc.moveDown(0.5);
+  labelValue("Extras ya cobrados", formatMoney(paidExtras), doc.y); doc.moveDown(0.65);
+  doc.roundedRect(left, doc.y - 4, pageWidth, 36, 8).fill(balance > 0 ? "#fff3d6" : "#e0f4e7");
+  doc.font("Helvetica-Bold").fontSize(11).fillColor(balance > 0 ? "#8e5a00" : "#176b43").text(balance > 0 ? "SALDO PENDIENTE" : "SALDO", left + 12, doc.y + 7);
+  doc.font("Helvetica-Bold").fontSize(14).fillColor(balance > 0 ? "#8e5a00" : "#176b43").text(formatMoney(balance), left + 12, doc.y + 5, { width: pageWidth - 24, align: "right" });
+  doc.y += 48;
+
+  sectionTitle("Movimientos de pago");
+  if (!payments.length) {
+    doc.font("Helvetica-Oblique").fontSize(9).fillColor("#65736a").text("No hay pagos individuales registrados.", left, doc.y, { width: pageWidth });
+    doc.moveDown(0.5);
+    if (Number(reservation.deposit || 0) > 0) doc.font("Helvetica").fontSize(9).fillColor("#48564d").text(`Seña informada en la reserva: ${formatMoney(reservation.deposit)} (se considera en el total abonado).`);
+  } else {
+    for (const payment of payments) {
+      const date = payment.createdAt ? formatDate(payment.createdAt) : "Fecha no informada";
+      const concept = payment.concept || payment.description || "Pago";
+      doc.font("Helvetica").fontSize(9).fillColor("#48564d").text(`${date} · ${concept}`, left, doc.y, { width: pageWidth - 120 });
+      doc.font("Helvetica-Bold").fontSize(9).fillColor("#24372d").text(formatMoney(payment.amount), right - 115, doc.y, { width: 115, align: "right" });
+      doc.moveDown(0.55);
+    }
+    if (Number(reservation.deposit || 0) > paymentsTotal) {
+      doc.font("Helvetica").fontSize(8).fillColor("#65736a").text(`Seña informada en la reserva: ${formatMoney(reservation.deposit)}. El sistema evita duplicarla con los movimientos registrados.`, left, doc.y, { width: pageWidth });
+      doc.moveDown(0.5);
+    }
+  }
+
+  doc.moveDown(0.8);
+  line(doc.y);
+  doc.moveDown(0.6);
+  doc.font("Helvetica").fontSize(8).fillColor("#65736a").text("Documento informativo de la cuenta de la estadía. Conserve este comprobante para su control.", left, doc.y, { width: pageWidth, align: "center" });
+  doc.end();
+});
+
 app.get("/api/reservations", (req, res) => {
   const db = readDb();
   let list = db.reservations.map((r) => ({
@@ -398,6 +565,44 @@ app.get("/api/reservations", (req, res) => {
   res.json(list);
 });
 
+// Gastos extras asociados a una reserva/cabaña.
+app.post("/api/reservations/:id/extras", async (req, res) => {
+  const db = readDb();
+  const reservation = db.reservations.find((r) => r.id === req.params.id);
+  if (!reservation) return res.status(404).json({ error: "Reserva no encontrada." });
+  const description = String(req.body?.description || "").trim();
+  const amount = Number(req.body?.amount);
+  const status = req.body?.status === "paid" ? "paid" : "pending";
+  if (!description) return res.status(400).json({ error: "Ingresá una descripción para el gasto extra." });
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "El importe debe ser mayor que cero." });
+  if (!Array.isArray(reservation.extraCharges)) reservation.extraCharges = [];
+  const extra = { id: uid(), description: description.slice(0, 160), amount, status, date: new Date().toISOString(), createdAt: new Date().toISOString() };
+  reservation.extraCharges.push(extra);
+  await writeDb(db);
+  res.status(201).json(extra);
+});
+app.put("/api/reservations/:id/extras/:extraId", async (req, res) => {
+  const db = readDb();
+  const reservation = db.reservations.find((r) => r.id === req.params.id);
+  if (!reservation) return res.status(404).json({ error: "Reserva no encontrada." });
+  const extra = (reservation.extraCharges || []).find((x) => x.id === req.params.extraId);
+  if (!extra) return res.status(404).json({ error: "Gasto extra no encontrado." });
+  if (req.body?.status !== "paid" && req.body?.status !== "pending") return res.status(400).json({ error: "Estado de cobro inválido." });
+  extra.status = req.body.status;
+  await writeDb(db);
+  res.json(extra);
+});
+app.delete("/api/reservations/:id/extras/:extraId", async (req, res) => {
+  const db = readDb();
+  const reservation = db.reservations.find((r) => r.id === req.params.id);
+  if (!reservation) return res.status(404).json({ error: "Reserva no encontrada." });
+  const existing = reservation.extraCharges || [];
+  if (!existing.some((x) => x.id === req.params.extraId)) return res.status(404).json({ error: "Gasto extra no encontrado." });
+  reservation.extraCharges = existing.filter((x) => x.id !== req.params.extraId);
+  await writeDb(db);
+  res.status(204).end();
+});
+
 app.post("/api/reservation-groups", async (req, res) => {
   const db = readDb();
   if (!Array.isArray(db.clients)) db.clients = [];
@@ -407,8 +612,9 @@ app.post("/api/reservation-groups", async (req, res) => {
   if (!String(client.name || "").trim() || !body.checkIn || !body.checkOut || !cabinsRequested.length) {
     return res.status(400).json({ error: "Completá cliente, fechas y al menos una cabaña." });
   }
-  const checkIn = body.checkIn;
-  const checkOut = body.checkOut;
+  const checkIn = fixedReservationDate(body.checkIn, CHECK_IN_TIME);
+  const checkOut = fixedReservationDate(body.checkOut, CHECK_OUT_TIME);
+  if (!checkIn || !checkOut) return res.status(400).json({ error: "Ingresá fechas de entrada y salida válidas." });
   if (normalizeDateTime(checkOut) <= normalizeDateTime(checkIn)) return res.status(400).json({ error: "La salida debe ser posterior a la entrada." });
   const adultsDefault = Number(body.adults || 0);
   const childrenDefault = Number(body.children || 0);
@@ -449,6 +655,8 @@ app.post("/api/reservation-groups", async (req, res) => {
 app.post("/api/reservations", async (req, res) => {
   const db = readDb();
   const r = { ...req.body, id: uid(), createdAt: new Date().toISOString(), status: req.body.status || "confirmada", guests: Number(req.body.guests || 0), cabinId: Number(req.body.cabinId) };
+  r.checkIn = fixedReservationDate(req.body.checkIn, CHECK_IN_TIME);
+  r.checkOut = fixedReservationDate(req.body.checkOut, CHECK_OUT_TIME);
   r.adults = Number(req.body.adults ?? r.guests);
   r.children = Number(req.body.children || 0);
   r.guests = r.adults + r.children;
@@ -486,6 +694,8 @@ app.put("/api/reservations/:id", async (req, res) => {
     cabinId: Number(req.body.cabinId ?? old.cabinId),
     guests: Number(req.body.guests ?? old.guests),
   };
+  r.checkIn = fixedReservationDate(req.body.checkIn ?? old.checkIn, CHECK_IN_TIME);
+  r.checkOut = fixedReservationDate(req.body.checkOut ?? old.checkOut, CHECK_OUT_TIME);
   r.adults = Number(req.body.adults ?? old.adults ?? r.guests);
   r.children = Number(req.body.children ?? old.children ?? 0);
   r.guests = r.adults + r.children;
@@ -494,6 +704,8 @@ app.put("/api/reservations/:id", async (req, res) => {
   const nights = getNights(r.checkIn, r.checkOut);
   r.total = (r.adults * r.adultPricePerPerson + r.children * r.childPricePerPerson) * nights;
   const cabin = cabins.find((c) => c.id === r.cabinId);
+  if (!cabin) return res.status(400).json({ error: "Cabaña inválida." });
+  if (!r.checkIn || !r.checkOut) return res.status(400).json({ error: "Ingresá fechas de entrada y salida válidas." });
   if (r.guests > cabin.capacity)
     return res
       .status(400)
